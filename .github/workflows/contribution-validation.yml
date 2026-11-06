@@ -1,0 +1,214 @@
+name: Review readiness - IBC-Go
+
+on:
+  push:
+    branches:
+      - validation/review-ready-2026-11-06
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: '1'
+  CC: gcc
+  CXX: g++
+  GOTOOLCHAIN: local
+  GOMAXPROCS: '4'
+  GOFLAGS: -p=2
+
+defaults:
+  run:
+    shell: bash
+    working-directory: source
+
+jobs:
+  build-and-lint:
+    if: github.repository == 'zakazaka95/ibc-go'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - pr: 9153
+            head: 156e5a164c335e9e5eff80c986ae5ca18e7fd2ca
+            tree: c1d1145a7405d7de676f4c788d4fff8c3bf94f77
+          - pr: 9154
+            head: 9724ada476f494ebc4a12dc1e43a8ad48d1bac05
+            tree: a8de7649f684fc7787b5b214d6a8fad3bbd9b5c7
+    name: Build and lint PR ${{ matrix.pr }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.head }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+      - name: Verify exact source snapshot
+        env:
+          EXPECTED_HEAD: ${{ matrix.head }}
+          EXPECTED_TREE: ${{ matrix.tree }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test "$(go env GOVERSION)" = "go$(awk '$1 == "go" {print $2; exit}' go.mod)"
+          git log -1 --format='%H %s'
+          go version
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libudev-dev libusb-1.0-0-dev
+      - name: Run pinned formatter and inspect source
+        run: |
+          set -euo pipefail
+          go install mvdan.cc/gofumpt@v0.8.0
+          make format
+          git diff --exit-code
+          git diff --check cb1e6fbf6481558ec2ecf5c30d9f9ad5e9f3af6b...HEAD
+      - name: Build application
+        run: LEDGER_ENABLED=false make build
+      - name: Check license headers
+        run: ./scripts/check-license-headers.sh
+      - name: Run pinned configured lint in every module
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ibc-ci-tools" "$RUNNER_TEMP/ibc-ci-shim"
+          GOBIN="$RUNNER_TEMP/ibc-ci-tools" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
+          export GOLANGCI_REAL_BIN="$RUNNER_TEMP/ibc-ci-tools/golangci-lint"
+          export LINT_EXIT_LOG="$RUNNER_TEMP/ibc-ci-lint-exits.tsv"
+          "$GOLANGCI_REAL_BIN" version
+          cat > "$RUNNER_TEMP/ibc-ci-shim/golangci-lint" <<'LINTER'
+          #!/usr/bin/env bash
+          set +e
+          "$GOLANGCI_REAL_BIN" "$@"
+          status=$?
+          printf '%s\t%s\n' "$status" "$PWD" >> "$LINT_EXIT_LOG"
+          exit "$status"
+          LINTER
+          chmod +x "$RUNNER_TEMP/ibc-ci-shim/golangci-lint"
+          export PATH="$RUNNER_TEMP/ibc-ci-shim:$PATH"
+          make lint 2>&1 | tee "$RUNNER_TEMP/ibc-ci-lint.log"
+          test -s "$LINT_EXIT_LOG"
+          cat "$LINT_EXIT_LOG"
+          expected=$(find . -type f -name go.mod | wc -l)
+          actual=$(wc -l < "$LINT_EXIT_LOG")
+          test "$actual" -eq "$expected"
+          awk -F '\t' '$1 != 0 {failed=1} END {exit failed}' "$LINT_EXIT_LOG"
+          if grep -Eq 'level=(error|fatal)|(^|[[:space:]])ERRO(R)?([[:space:]]|$)|^Error:|\(typecheck\)' "$RUNNER_TEMP/ibc-ci-lint.log"; then
+            echo 'Linter reported a loading or type-checking error.'
+            exit 1
+          fi
+      - name: Confirm tracked source is unchanged
+        if: always()
+        run: git diff --exit-code
+
+  unit-tests:
+    if: github.repository == 'zakazaka95/ibc-go'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - pr: 9153
+            head: 156e5a164c335e9e5eff80c986ae5ca18e7fd2ca
+            tree: c1d1145a7405d7de676f4c788d4fff8c3bf94f77
+          - pr: 9154
+            head: 9724ada476f494ebc4a12dc1e43a8ad48d1bac05
+            tree: a8de7649f684fc7787b5b214d6a8fad3bbd9b5c7
+    name: Unit tests PR ${{ matrix.pr }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.head }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+      - name: Verify exact source snapshot
+        env:
+          EXPECTED_HEAD: ${{ matrix.head }}
+          EXPECTED_TREE: ${{ matrix.tree }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test "$(go env GOVERSION)" = "go$(awk '$1 == "go" {print $2; exit}' go.mod)"
+          git log -1 --format='%H %s'
+          go version
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libudev-dev libusb-1.0-0-dev
+      - name: Run required unit target across repository modules
+        run: make test-unit
+      - name: Confirm tracked source is unchanged
+        if: always()
+        run: git diff --exit-code
+
+  docs:
+    if: github.repository == 'zakazaka95/ibc-go'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - pr: 9153
+            head: 156e5a164c335e9e5eff80c986ae5ca18e7fd2ca
+            tree: c1d1145a7405d7de676f4c788d4fff8c3bf94f77
+          - pr: 9154
+            head: 9724ada476f494ebc4a12dc1e43a8ad48d1bac05
+            tree: a8de7649f684fc7787b5b214d6a8fad3bbd9b5c7
+    name: Documentation PR ${{ matrix.pr }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.head }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Verify exact source snapshot
+        env:
+          EXPECTED_HEAD: ${{ matrix.head }}
+          EXPECTED_TREE: ${{ matrix.tree }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          git log -1 --format='%H %s'
+          node --version
+      - name: Run pinned documentation lint
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/ibc-md-tools" --no-audit --no-fund markdownlint-cli2@0.24.0
+          export PATH="$RUNNER_TEMP/ibc-md-tools/node_modules/.bin:$PATH"
+          make lint-docs
+      - name: Build documentation
+        run: make build-docs
+      - name: Confirm tracked source is unchanged
+        if: always()
+        run: git diff --exit-code
